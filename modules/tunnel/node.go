@@ -121,14 +121,6 @@ func (n *Node) onlineChannels() []*dataChannel {
 	return out
 }
 
-// controlUp reports whether the control channel is currently considered up
-// (attached and not past its grace window).
-func (n *Node) controlUp() bool {
-	n.mu.RLock()
-	defer n.mu.RUnlock()
-	return n.control != nil && n.controlDown.IsZero()
-}
-
 // newStreamsAllowed reports whether new streams may be opened. New streams are
 // blocked the moment the control channel drops (design §3 decision #3 → 503),
 // even though in-flight streams continue during the grace window.
@@ -139,10 +131,10 @@ func (n *Node) newStreamsAllowed() bool {
 }
 
 // PickChannel selects the least-loaded online data channel with a free stream
-// slot. If all online channels are saturated it waits up to queue_timeout for a
-// slot to free (design §7.2). Returns ErrQueueTimeout (→503) on timeout,
-// ErrNodeDownNewStream (→503) if control is down, ErrNoOnlineChannels (→502) if
-// the node has no online channels at all.
+// slot. If all online channels are saturated (or none are online yet) it waits
+// up to queue_timeout for a slot to free (design §7.2). Returns:
+//   - ErrNodeDownNewStream (→503) if the control channel is down;
+//   - ErrQueueTimeout (→503) if no slot frees within queue_timeout.
 func (n *Node) PickChannel(ctx context.Context, queueTimeout time.Duration) (*dataChannel, error) {
 	if !n.newStreamsAllowed() {
 		return nil, ErrNodeDownNewStream
@@ -158,14 +150,19 @@ func (n *Node) PickChannel(ctx context.Context, queueTimeout time.Duration) (*da
 
 	backoff := 2 * time.Millisecond
 	const maxBackoff = 50 * time.Millisecond
+	countedSaturated := false
 	for {
 		ch := n.leastLoaded(max)
 		if ch != nil {
 			n.recordPeak()
 			return ch, nil
 		}
-		// No free slot: saturated. Record and wait.
-		n.recordSaturated()
+		// No free slot: saturated. Count this request as a saturation event
+		// once (not once per poll), and keep the peak-demand high-water fresh.
+		if !countedSaturated {
+			n.recordSaturated()
+			countedSaturated = true
+		}
 		n.recordPeak()
 
 		select {

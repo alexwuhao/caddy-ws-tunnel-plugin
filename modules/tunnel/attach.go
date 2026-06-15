@@ -31,7 +31,7 @@ func (n *Node) attachControl(ctx context.Context, conn *websocket.Conn, heartbea
 	n.mu.Lock()
 	// Preserve session across in-grace reconnect so existing data channels
 	// (which were validated against the old session) remain valid.
-	reconnived := !n.controlDown.IsZero() && n.session != ""
+	inGraceReconnect := !n.controlDown.IsZero() && n.session != ""
 	if n.control != nil {
 		n.control.close("replaced by new control channel")
 	}
@@ -43,7 +43,7 @@ func (n *Node) attachControl(ctx context.Context, conn *websocket.Conn, heartbea
 	session := n.session
 	n.mu.Unlock()
 
-	if reconnived {
+	if inGraceReconnect {
 		log.Info("control channel reconnected within grace window", zap.String("node", n.Name))
 	}
 
