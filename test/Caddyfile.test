@@ -1,0 +1,33 @@
+{
+	# Tunnel app is registered implicitly by the tunnel_server handler block.
+	# Use an explicit admin/log block here if needed.
+	auto_https disable_redirects
+}
+
+# Client access plane: tunnel WS ingress + status.
+:8443 {
+	tls internal
+
+	route /ws* {
+		tunnel_server {
+			node node1 {
+				key      xx1
+				channels 2
+				port 8080
+				port 9090 127.0.0.1:9090
+			}
+		}
+	}
+
+	route /status* {
+		tunnel_status
+	}
+}
+
+# Business ingress: external request -> tunnel.
+node1.localhost {
+	tls internal
+	reverse_proxy {
+		transport tunnel node1:8080
+	}
+}
