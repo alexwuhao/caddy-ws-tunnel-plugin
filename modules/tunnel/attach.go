@@ -103,6 +103,7 @@ func (n *Node) attachData(ctx context.Context, conn *websocket.Conn, hello *prot
 	n.mu.Lock()
 	if old, ok := n.channels[hello.ChannelID]; ok {
 		old.close()
+		n.dataReconnectTotal++ // Track reconnect events
 	}
 	n.channels[hello.ChannelID] = ch
 	n.mu.Unlock()
@@ -147,16 +148,29 @@ func (n *Node) checkGrace() {
 	if n.controlDown.IsZero() {
 		return // control is up
 	}
-	if time.Since(n.controlDown) < n.graceWindow {
+	elapsed := time.Since(n.controlDown)
+	if elapsed < n.graceWindow {
 		return // still within grace; keep in-flight streams alive
 	}
 	// Grace expired: tear down everything.
+	activeChannels := len(n.channels)
+	session := n.session
+
 	for id, ch := range n.channels {
 		ch.close()
 		delete(n.channels, id)
 	}
 	n.session = ""
 	n.control = nil
+
+	// Log teardown for production diagnostics
+	n.log.Warn("grace window expired, node torn down",
+		zap.String("node", n.Name),
+		zap.Duration("down_duration", elapsed),
+		zap.Duration("grace_window", n.graceWindow),
+		zap.Int("channels_closed", activeChannels),
+		zap.String("session_cleared", session),
+	)
 }
 
 // pushReloadConfig sends the current authoritative config to the client over

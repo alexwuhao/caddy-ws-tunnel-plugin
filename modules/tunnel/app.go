@@ -65,6 +65,9 @@ func (a *TunnelApp) Provision(ctx caddy.Context) error {
 			a.Nodes[name] = cfg
 		}
 		cfg.fill()
+		if cfg.Channels <= 0 {
+			return fmt.Errorf("node %s: channels must be > 0, got %d", name, cfg.Channels)
+		}
 		if err := validatePorts(name, cfg.Ports); err != nil {
 			return err
 		}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/wjzhangq/caddy-ws-tunnel-plugin/modules/tunnel/proto"
@@ -90,12 +91,13 @@ type Node struct {
 	channels map[int]*dataChannel
 
 	// capacity / peak stats (design §7.3)
-	queued                int64 // requests currently waiting for a slot
-	openedTotal           int64
-	peakDemand            int64
-	channelsNeededAtPeak  int
-	saturatedTotal        int64
-	lastError             string
+	queued               int64 // requests currently waiting for a slot (protected by mu)
+	openedTotal          int64 // (protected by mu)
+	peakDemand           int64 // atomic: high-water mark for demand
+	channelsNeededAtPeak int   // (protected by mu)
+	saturatedTotal       int64 // atomic: total saturation events
+	dataReconnectTotal   int64 // (protected by mu) data channel reconnects
+	lastError            string // (protected by mu)
 }
 
 func newNode(name string, cfg *NodeConfig, hb time.Duration, log *zap.Logger) *Node {
@@ -223,28 +225,39 @@ func (n *Node) markQueued(delta int64) {
 }
 
 // recordPeak updates the sliding peak_demand high-water mark = active + queued.
+// Uses atomic operations for peakDemand to reduce lock contention on hot path.
 func (n *Node) recordPeak() {
 	active := int64(0)
 	for _, ch := range n.onlineChannels() {
 		active += int64(ch.activeStreams())
 	}
-	n.mu.Lock()
+
+	n.mu.RLock()
 	demand := active + n.queued
-	if demand > n.peakDemand {
-		n.peakDemand = demand
+	n.mu.RUnlock()
+
+	// Atomic CAS loop: only update if demand exceeds current peak
+	for {
+		old := atomic.LoadInt64(&n.peakDemand)
+		if demand <= old {
+			break
+		}
+		if atomic.CompareAndSwapInt64(&n.peakDemand, old, demand) {
+			// Only update channelsNeededAtPeak when peakDemand actually changes
+			max := n.cfg.MaxStreamsPerConn
+			if max > 0 {
+				needed := int((demand + int64(max) - 1) / int64(max)) // ceil
+				n.mu.Lock()
+				n.channelsNeededAtPeak = needed
+				n.mu.Unlock()
+			}
+			break
+		}
 	}
-	max := n.cfg.MaxStreamsPerConn
-	if max > 0 {
-		needed := int((n.peakDemand + int64(max) - 1) / int64(max)) // ceil
-		n.channelsNeededAtPeak = needed
-	}
-	n.mu.Unlock()
 }
 
 func (n *Node) recordSaturated() {
-	n.mu.Lock()
-	n.saturatedTotal++
-	n.mu.Unlock()
+	atomic.AddInt64(&n.saturatedTotal, 1)
 }
 
 func (n *Node) incOpened() {
@@ -253,7 +266,12 @@ func (n *Node) incOpened() {
 	n.mu.Unlock()
 }
 
+const maxErrorLen = 512
+
 func (n *Node) setLastError(s string) {
+	if len(s) > maxErrorLen {
+		s = s[:maxErrorLen-3] + "..."
+	}
 	n.mu.Lock()
 	n.lastError = s
 	n.mu.Unlock()

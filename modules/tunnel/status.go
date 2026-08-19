@@ -67,11 +67,12 @@ func (s *TunnelStatus) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddy
 	}
 	type capacityStatus struct {
 		MaxStreamsPerConn     int     `json:"max_streams_per_conn"`
-		MaxConcurrent        int     `json:"max_concurrent"`
-		PeakDemand           int64   `json:"peak_demand"`
-		ChannelsNeededAtPeak int     `json:"channels_needed_at_peak"`
-		PeakUtilization      float64 `json:"peak_utilization"`
-		SaturatedTotal       int64   `json:"saturated_total"`
+		MaxConcurrent         int     `json:"max_concurrent"`
+		PeakDemand            int64   `json:"peak_demand"`
+		ChannelsNeededAtPeak  int     `json:"channels_needed_at_peak"`
+		PeakUtilization       float64 `json:"peak_utilization"`
+		SaturatedTotal        int64   `json:"saturated_total"`
+		DataReconnectTotal    int64   `json:"data_reconnect_total"`
 	}
 	type trafficStatus struct {
 		BytesIn   int64 `json:"bytes_in"`
@@ -137,11 +138,12 @@ func (s *TunnelStatus) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddy
 			Streams:  streamStatus{Active: active, OpenedTotal: n.openedTotal, QueueDepth: n.queued},
 			Capacity: capacityStatus{
 				MaxStreamsPerConn:     n.cfg.MaxStreamsPerConn,
-				MaxConcurrent:        maxConc,
-				PeakDemand:           n.peakDemand,
-				ChannelsNeededAtPeak: n.channelsNeededAtPeak,
-				PeakUtilization:      peakUtil,
-				SaturatedTotal:       n.saturatedTotal,
+				MaxConcurrent:         maxConc,
+				PeakDemand:            atomic.LoadInt64(&n.peakDemand),
+				ChannelsNeededAtPeak:  n.channelsNeededAtPeak,
+				PeakUtilization:       peakUtil,
+				SaturatedTotal:        atomic.LoadInt64(&n.saturatedTotal),
+				DataReconnectTotal:    n.dataReconnectTotal,
 			},
 			Traffic:   trafficStatus{BytesIn: totalIn, BytesOut: totalOut},
 			Ports:     ports,

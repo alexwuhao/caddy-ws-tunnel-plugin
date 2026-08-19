@@ -112,3 +112,68 @@ func TestNodeConfigDefaults(t *testing.T) {
 		t.Fatalf("max_streams default = %d, want %d", c.MaxStreamsPerConn, DefaultMaxStreamsPerConn)
 	}
 }
+
+func TestCheckGraceExpiry(t *testing.T) {
+	cfg := &NodeConfig{Channels: 2, MaxStreamsPerConn: 10}
+	cfg.fill()
+	graceWindow := 3 * time.Second
+	n := newNode("test", cfg, 1*time.Second, zap.NewNop())
+	n.graceWindow = graceWindow
+
+	// Simulate control down longer than grace window
+	n.mu.Lock()
+	n.controlDown = time.Now().Add(-4 * time.Second) // expired
+	n.session = "test-session"
+	n.control = &controlChannel{done: make(chan struct{})}
+	// Add some data channels
+	n.channels[0] = &dataChannel{id: 0}
+	n.channels[1] = &dataChannel{id: 1}
+	n.mu.Unlock()
+
+	// Run grace check
+	n.checkGrace()
+
+	// Verify teardown
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if n.session != "" {
+		t.Error("session should be cleared after grace expiry")
+	}
+	if n.control != nil {
+		t.Error("control should be nil after grace expiry")
+	}
+	if len(n.channels) != 0 {
+		t.Errorf("channels should be torn down after grace expiry, got %d", len(n.channels))
+	}
+}
+
+func TestCheckGraceWithinWindow(t *testing.T) {
+	cfg := &NodeConfig{Channels: 2, MaxStreamsPerConn: 10}
+	cfg.fill()
+	graceWindow := 3 * time.Second
+	n := newNode("test", cfg, 1*time.Second, zap.NewNop())
+	n.graceWindow = graceWindow
+
+	// Simulate control down but within grace window
+	n.mu.Lock()
+	n.controlDown = time.Now().Add(-1 * time.Second) // still within 3s grace
+	n.session = "test-session"
+	n.control = &controlChannel{done: make(chan struct{})}
+	n.channels[0] = &dataChannel{id: 0}
+	n.mu.Unlock()
+
+	// Run grace check
+	n.checkGrace()
+
+	// Verify no teardown
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if n.session == "" {
+		t.Error("session should NOT be cleared within grace window")
+	}
+	if len(n.channels) == 0 {
+		t.Error("channels should NOT be torn down within grace window")
+	}
+}
+
+
