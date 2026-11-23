@@ -66,19 +66,26 @@ func (s *TunnelStatus) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddy
 		QueueDepth  int64 `json:"queue_depth"`
 	}
 	type capacityStatus struct {
-		MaxStreamsPerConn     int     `json:"max_streams_per_conn"`
-		MaxConcurrent         int     `json:"max_concurrent"`
-		PeakDemand            int64   `json:"peak_demand"`
-		ChannelsNeededAtPeak  int     `json:"channels_needed_at_peak"`
-		PeakUtilization       float64 `json:"peak_utilization"`
-		SaturatedTotal        int64   `json:"saturated_total"`
-		DataReconnectTotal    int64   `json:"data_reconnect_total"`
+		MaxStreamsPerConn    int     `json:"max_streams_per_conn"`
+		MaxConcurrent        int     `json:"max_concurrent"`
+		PeakDemand           int64   `json:"peak_demand"`
+		ChannelsNeededAtPeak int     `json:"channels_needed_at_peak"`
+		PeakUtilization      float64 `json:"peak_utilization"`
+		SaturatedTotal       int64   `json:"saturated_total"`
+		DataReconnectTotal   int64   `json:"data_reconnect_total"`
 	}
 	type trafficStatus struct {
-		BytesIn   int64 `json:"bytes_in"`
-		BytesOut  int64 `json:"bytes_out"`
-		RateInBps int64 `json:"rate_in_bps"`
+		BytesIn    int64 `json:"bytes_in"`
+		BytesOut   int64 `json:"bytes_out"`
+		RateInBps  int64 `json:"rate_in_bps"`
 		RateOutBps int64 `json:"rate_out_bps"`
+	}
+	type clientStatus struct {
+		Channels        int   `json:"channels"`
+		Streams         int   `json:"streams"`
+		BytesIn         int64 `json:"bytes_in"`
+		BytesOut        int64 `json:"bytes_out"`
+		LocalDialErrors int64 `json:"local_dial_errors"`
 	}
 	type nodeSnapshot struct {
 		Node      string         `json:"node"`
@@ -88,6 +95,7 @@ func (s *TunnelStatus) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddy
 		Streams   streamStatus   `json:"streams"`
 		Capacity  capacityStatus `json:"capacity"`
 		Traffic   trafficStatus  `json:"traffic"`
+		Client    *clientStatus  `json:"client,omitempty"`
 		Ports     []string       `json:"ports"`
 		LastError *string        `json:"last_error"`
 	}
@@ -106,29 +114,36 @@ func (s *TunnelStatus) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddy
 		}
 		onlineCnt := 0
 		var active int64
-		var totalIn, totalOut int64
 		for _, ch := range n.channels {
 			if ch.online() {
 				onlineCnt++
 			}
 			active += atomic.LoadInt64(&ch.active)
-			in, out := ch.trafficBytes()
-			totalIn += in
-			totalOut += out
 		}
 		ports := make([]string, 0, len(n.cfg.Ports))
 		for p := range n.cfg.Ports {
 			ports = append(ports, p)
 		}
 		maxConc := n.cfg.Channels * n.cfg.MaxStreamsPerConn
+		peakDemand := atomic.LoadInt64(&n.peakDemand)
 		var peakUtil float64
 		if maxConc > 0 {
-			peakUtil = float64(n.peakDemand) / float64(maxConc)
+			peakUtil = float64(peakDemand) / float64(maxConc)
 		}
 		var lastErr *string
 		if n.lastError != "" {
 			s := n.lastError
 			lastErr = &s
+		}
+		var clientSnap *clientStatus
+		if n.clientStats != nil {
+			clientSnap = &clientStatus{
+				Channels:        n.clientStats.Channels,
+				Streams:         n.clientStats.Streams,
+				BytesIn:         n.clientStats.BytesIn,
+				BytesOut:        n.clientStats.BytesOut,
+				LocalDialErrors: atomic.LoadInt64(&n.clientDialErrors),
+			}
 		}
 		snap := nodeSnapshot{
 			Node:     n.Name,
@@ -137,19 +152,27 @@ func (s *TunnelStatus) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddy
 			Channels: channelStatus{Configured: n.cfg.Channels, Online: onlineCnt},
 			Streams:  streamStatus{Active: active, OpenedTotal: n.openedTotal, QueueDepth: n.queued},
 			Capacity: capacityStatus{
-				MaxStreamsPerConn:     n.cfg.MaxStreamsPerConn,
-				MaxConcurrent:         maxConc,
-				PeakDemand:            atomic.LoadInt64(&n.peakDemand),
-				ChannelsNeededAtPeak:  n.channelsNeededAtPeak,
-				PeakUtilization:       peakUtil,
-				SaturatedTotal:        atomic.LoadInt64(&n.saturatedTotal),
-				DataReconnectTotal:    n.dataReconnectTotal,
+				MaxStreamsPerConn:    n.cfg.MaxStreamsPerConn,
+				MaxConcurrent:        maxConc,
+				PeakDemand:           peakDemand,
+				ChannelsNeededAtPeak: n.channelsNeededAtPeak,
+				PeakUtilization:      peakUtil,
+				SaturatedTotal:       atomic.LoadInt64(&n.saturatedTotal),
+				DataReconnectTotal:   n.dataReconnectTotal,
 			},
-			Traffic:   trafficStatus{BytesIn: totalIn, BytesOut: totalOut},
+			Traffic:   trafficStatus{}, // filled in below, after the RLock is released
+			Client:    clientSnap,
 			Ports:     ports,
 			LastError: lastErr,
 		}
 		n.mu.RUnlock()
+
+		// Traffic totals/rates take their own locks, so collect them outside the
+		// node RLock to avoid re-entering the RWMutex while a writer is queued.
+		totalIn, totalOut := n.TrafficTotals()
+		rateInBps, rateOutBps := n.Rates()
+		snap.Traffic = trafficStatus{BytesIn: totalIn, BytesOut: totalOut, RateInBps: rateInBps, RateOutBps: rateOutBps}
+
 		snapshots = append(snapshots, snap)
 	}
 

@@ -26,6 +26,12 @@ type TunnelApp struct {
 
 	// Heartbeat is the control-channel ping interval; grace window = ×3.
 	Heartbeat caddy.Duration `json:"heartbeat,omitempty"`
+	// DialTimeout bounds opening a stream and writing its header, and the
+	// reverse_proxy response-header wait (design §3.4). Zero = default.
+	DialTimeout caddy.Duration `json:"dial_timeout,omitempty"`
+	// QueueTimeout bounds how long a request waits for a free stream slot when
+	// every data channel is saturated (design §7.2). Zero = default.
+	QueueTimeout caddy.Duration `json:"queue_timeout,omitempty"`
 
 	registry  *NodeRegistry
 	logger    *zap.Logger
@@ -33,6 +39,11 @@ type TunnelApp struct {
 	ctx       caddy.Context
 	sweepStop chan struct{}
 	sweepDone chan struct{}
+
+	// rate sampler lifecycle (design §12: rates estimated over a sliding
+	// window instead of being reported as zero).
+	rateStop chan struct{}
+	rateDone chan struct{}
 }
 
 // CaddyModule returns the Caddy module information.
@@ -50,6 +61,22 @@ func (a *TunnelApp) heartbeat() time.Duration {
 	return DefaultHeartbeat
 }
 
+// dialTimeout returns the configured stream-open timeout or its default.
+func (a *TunnelApp) dialTimeout() time.Duration {
+	if a.DialTimeout > 0 {
+		return time.Duration(a.DialTimeout)
+	}
+	return DefaultDialTimeout
+}
+
+// queueTimeout returns the configured backpressure queue timeout or its default.
+func (a *TunnelApp) queueTimeout() time.Duration {
+	if a.QueueTimeout > 0 {
+		return time.Duration(a.QueueTimeout)
+	}
+	return DefaultQueueTimeout
+}
+
 // Provision builds the registry from config, validates ports, and registers
 // metrics.
 func (a *TunnelApp) Provision(ctx caddy.Context) error {
@@ -65,17 +92,38 @@ func (a *TunnelApp) Provision(ctx caddy.Context) error {
 			a.Nodes[name] = cfg
 		}
 		cfg.fill()
-		if cfg.Channels <= 0 {
-			return fmt.Errorf("node %s: channels must be > 0, got %d", name, cfg.Channels)
-		}
-		if err := validatePorts(name, cfg.Ports); err != nil {
+		if err := validateNodeConfig(name, cfg); err != nil {
 			return err
 		}
-		a.registry.put(newNode(name, cfg, hb, a.logger))
+		nd := newNode(name, cfg, hb, a.logger)
+		nd.dialTimeout = a.dialTimeout()
+		nd.queueTimeout = a.queueTimeout()
+		a.registry.put(nd)
 	}
 	a.logger.Info("tunnel app provisioned",
-		zap.Int("nodes", len(a.Nodes)), zap.Duration("heartbeat", hb))
+		zap.Int("nodes", len(a.Nodes)), zap.Duration("heartbeat", hb),
+		zap.Duration("dial_timeout", a.dialTimeout()), zap.Duration("queue_timeout", a.queueTimeout()))
 	return nil
+}
+
+// validateNodeConfig rejects node configs that cannot work or that would silently
+// fall back to defaults the operator did not ask for (design §3.1/§3.4).
+func validateNodeConfig(name string, cfg *NodeConfig) error {
+	if len(cfg.Ports) == 0 {
+		return fmt.Errorf("node %s: at least one 'port' mapping is required", name)
+	}
+	// Never allow an unauthenticated node: an empty key with no hmac_secret would
+	// let any client with an empty key through (empty == empty).
+	if cfg.Key == "" && cfg.HMACSecret == "" {
+		return fmt.Errorf("node %s: set 'key' (plaintext auth) or 'hmac_secret' (HMAC auth)", name)
+	}
+	if cfg.Channels <= 0 {
+		return fmt.Errorf("node %s: channels must be > 0", name)
+	}
+	if cfg.MaxStreamsPerConn <= 0 {
+		return fmt.Errorf("node %s: max_streams_per_conn must be > 0", name)
+	}
+	return validatePorts(name, cfg.Ports)
 }
 
 // validatePorts enforces digits-only port ids (design §0 decision #1).
@@ -89,21 +137,30 @@ func validatePorts(node string, ports map[string]string) error {
 }
 
 // Start launches the health-sweep goroutine (grace window enforcement + metric
-// refresh).
+// refresh) and the traffic-rate sampler (design §12).
 func (a *TunnelApp) Start() error {
 	a.sweepStop = make(chan struct{})
 	a.sweepDone = make(chan struct{})
 	go a.healthSweep()
+
+	a.rateStop = make(chan struct{})
+	a.rateDone = make(chan struct{})
+	go a.rateSampler()
+
 	lastApp = a
 	a.logger.Info("tunnel app started")
 	return nil
 }
 
-// Stop drains nodes and stops the sweep.
+// Stop drains nodes and stops the background goroutines.
 func (a *TunnelApp) Stop() error {
 	if a.sweepStop != nil {
 		close(a.sweepStop)
 		<-a.sweepDone
+	}
+	if a.rateStop != nil {
+		close(a.rateStop)
+		<-a.rateDone
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -147,6 +204,26 @@ func (a *TunnelApp) healthSweep() {
 				if a.metrics != nil {
 					a.metrics.update(n)
 				}
+			}
+		}
+	}
+}
+
+// rateSampler folds each node's cumulative byte counters into its sliding-window
+// rate meters once per rateSampleInterval (design §12). The window is short and
+// the sample cheap (a few atomic loads), so this runs independently of the
+// health sweep to keep rate resolution at ~1s regardless of heartbeat.
+func (a *TunnelApp) rateSampler() {
+	defer close(a.rateDone)
+	t := time.NewTicker(rateSampleInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-a.rateStop:
+			return
+		case <-t.C:
+			for _, n := range a.registry.all() {
+				n.sampleTraffic()
 			}
 		}
 	}

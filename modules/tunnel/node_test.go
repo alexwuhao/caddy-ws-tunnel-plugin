@@ -175,5 +175,3 @@ func TestCheckGraceWithinWindow(t *testing.T) {
 		t.Error("channels should NOT be torn down within grace window")
 	}
 }
-
-

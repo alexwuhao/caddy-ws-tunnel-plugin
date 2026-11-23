@@ -43,6 +43,12 @@ type NodeConfig struct {
 	Channels          int               `json:"channels,omitempty"`
 	MaxStreamsPerConn int               `json:"max_streams_per_conn,omitempty"`
 	Ports             map[string]string `json:"ports,omitempty"`
+
+	// HMACSecret, when non-empty, switches this node to HMAC-SHA256
+	// challenge-response authentication (design §10): the client must prove
+	// possession of the secret via hello.ts/hello.nonce/hello.sig instead of
+	// sending the plaintext key. Empty keeps the legacy plaintext-key posture.
+	HMACSecret string `json:"hmac_secret,omitempty"`
 }
 
 // fill applies defaults to zero-valued fields.
@@ -59,8 +65,9 @@ func (c *NodeConfig) fill() {
 }
 
 // toProtoConfig builds the wire Config pushed to the client inside welcome and
-// reload_config.
-func (c *NodeConfig) toProtoConfig() *proto.Config {
+// reload_config. dialTimeout/queueTimeout are passed in because they are
+// app-level settings that the client should mirror.
+func (c *NodeConfig) toProtoConfig(dialTimeout, queueTimeout time.Duration) *proto.Config {
 	ports := make(map[string]string, len(c.Ports))
 	for k, v := range c.Ports {
 		ports[k] = v
@@ -69,8 +76,8 @@ func (c *NodeConfig) toProtoConfig() *proto.Config {
 		Ports:             ports,
 		MaxStreamsPerConn: c.MaxStreamsPerConn,
 		Channels:          c.Channels,
-		DialTimeout:       DefaultDialTimeout.String(),
-		QueueTimeout:      DefaultQueueTimeout.String(),
+		DialTimeout:       dialTimeout.String(),
+		QueueTimeout:      queueTimeout.String(),
 	}
 }
 
@@ -83,21 +90,39 @@ type Node struct {
 
 	mu sync.RWMutex
 	// control channel
-	control      *controlChannel
-	session      string    // minted at control attach; data channels must match
-	controlDown  time.Time // zero when control is up; set when control drops
-	graceWindow  time.Duration
+	control     *controlChannel
+	session     string    // minted at control attach; data channels must match
+	controlDown time.Time // zero when control is up; set when control drops
+	graceWindow time.Duration
 	// data channels keyed by channel id
 	channels map[int]*dataChannel
 
+	// App-level tunables mirrored to the client in welcome/reload_config. Set
+	// once at node creation (before the node is registered), never mutated.
+	dialTimeout  time.Duration
+	queueTimeout time.Duration
+
 	// capacity / peak stats (design §7.3)
-	queued               int64 // requests currently waiting for a slot (protected by mu)
-	openedTotal          int64 // (protected by mu)
-	peakDemand           int64 // atomic: high-water mark for demand
-	channelsNeededAtPeak int   // (protected by mu)
-	saturatedTotal       int64 // atomic: total saturation events
-	dataReconnectTotal   int64 // (protected by mu) data channel reconnects
+	queued               int64  // requests currently waiting for a slot (protected by mu)
+	openedTotal          int64  // (protected by mu)
+	peakDemand           int64  // atomic: high-water mark for demand
+	channelsNeededAtPeak int    // (protected by mu)
+	saturatedTotal       int64  // atomic: total saturation events
+	dataReconnectTotal   int64  // (protected by mu) data channel reconnects
 	lastError            string // (protected by mu)
+
+	// traffic / rate stats (design §12). Byte counters live on each live data
+	// channel; when a channel goes away its totals are folded into retired* so
+	// the node's cumulative traffic and rate estimate survive channel churn.
+	retiredIn  int64 // (protected by mu)
+	retiredOut int64 // (protected by mu)
+	rateIn     *rateMeter
+	rateOut    *rateMeter
+
+	// client-reported telemetry (design §5 'stats'). Applied from the control
+	// channel read loop; exported through /status and Prometheus.
+	clientStats      *proto.Stats // (protected by mu)
+	clientDialErrors int64        // atomic; mirrors clientStats.LocalDialErrors
 }
 
 func newNode(name string, cfg *NodeConfig, hb time.Duration, log *zap.Logger) *Node {
@@ -107,6 +132,8 @@ func newNode(name string, cfg *NodeConfig, hb time.Duration, log *zap.Logger) *N
 		log:         log,
 		graceWindow: hb * 3,
 		channels:    map[int]*dataChannel{},
+		rateIn:      newRateMeter(),
+		rateOut:     newRateMeter(),
 	}
 }
 
@@ -146,9 +173,17 @@ func (n *Node) PickChannel(ctx context.Context, queueTimeout time.Duration) (*da
 	deadline := time.NewTimer(queueTimeout)
 	defer deadline.Stop()
 
-	// Count this caller as queued demand for peak stats while it waits.
+	// Count this caller as queued demand ONLY while it is actually waiting. On
+	// success the reserved slot is already reflected in active, so the caller
+	// must leave the queue before recordPeak or it would be counted twice
+	// (active + queued), inflating peak_demand.
 	n.markQueued(1)
-	defer n.markQueued(-1)
+	queued := true
+	defer func() {
+		if queued {
+			n.markQueued(-1)
+		}
+	}()
 
 	backoff := 2 * time.Millisecond
 	const maxBackoff = 50 * time.Millisecond
@@ -156,6 +191,10 @@ func (n *Node) PickChannel(ctx context.Context, queueTimeout time.Duration) (*da
 	for {
 		ch := n.leastLoaded(max)
 		if ch != nil {
+			if queued {
+				n.markQueued(-1)
+				queued = false
+			}
 			n.recordPeak()
 			return ch, nil
 		}
@@ -274,6 +313,22 @@ func (n *Node) setLastError(s string) {
 	}
 	n.mu.Lock()
 	n.lastError = s
+	n.mu.Unlock()
+}
+
+// applyStats records a client telemetry frame (design §5 'stats'). The client
+// reports its own view (channel count, stream count, local dial errors); the
+// server-side counters remain authoritative for traffic, but client dial errors
+// are only visible here, so they feed /status and the local-dial-errors gauge.
+func (n *Node) applyStats(s *proto.Stats) {
+	if s == nil {
+		return
+	}
+	if s.LocalDialErrors >= 0 {
+		atomic.StoreInt64(&n.clientDialErrors, s.LocalDialErrors)
+	}
+	n.mu.Lock()
+	n.clientStats = s
 	n.mu.Unlock()
 }
 

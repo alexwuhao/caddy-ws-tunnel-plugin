@@ -7,6 +7,8 @@ package stubclient
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -26,6 +28,10 @@ type Client struct {
 	// LocalAddrOverride, if set, replaces all allowlist addresses (so tests can
 	// point every port id at one echo server).
 	LocalAddrOverride string
+	// HMACSecret, if set, switches hellos to HMAC mode (design §10): every
+	// control- and data-channel hello carries a fresh ts/nonce and a signature
+	// produced with proto.SignHello. Empty keeps the legacy plaintext-key hello.
+	HMACSecret string
 
 	mu        sync.Mutex
 	allow     map[string]string // port id -> local addr
@@ -101,11 +107,33 @@ var NodeNameForKey = func(key string) string { return "node1" }
 func (c *Client) nodeName() string { return NodeNameForKey(c.Key) }
 
 func (c *Client) writeHello(ctx context.Context, conn *websocket.Conn, h proto.Hello) error {
+	// Every hello must carry a fresh nonce: in HMAC mode it is part of the
+	// signature, and the server rejects a reused (node, nonce) pair within the
+	// clock-skew window. Plaintext mode still sends ts/nonce for forward
+	// compatibility, exactly like the real client.
+	if h.Nonce == "" {
+		h.Nonce = newNonce()
+	}
+	if h.Ts == 0 {
+		h.Ts = time.Now().Unix()
+	}
+	if c.HMACSecret != "" {
+		h.Sig = proto.SignHello(c.HMACSecret, h.Node, h.Ts, h.Nonce)
+	}
 	raw, err := proto.WrapEnvelope(proto.TypeHello, h)
 	if err != nil {
 		return err
 	}
 	return conn.Write(ctx, websocket.MessageBinary, raw)
+}
+
+// newNonce returns a fresh 16-byte hex nonce for one hello.
+func newNonce() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
 }
 
 func readWelcome(ctx context.Context, conn *websocket.Conn) (*proto.Welcome, error) {

@@ -45,9 +45,12 @@ func WrapEnvelope(typ string, payload any) ([]byte, error) {
 // are required; Session MUST match the value handed out in the control-channel
 // Welcome (design §10 anti-orphan-injection).
 //
-// HMAC fields (Ts/Nonce/Sig) are part of the contract but unused in the
-// plaintext-key auth posture; they are accepted-and-ignored by the server for
-// forward compatibility.
+// HMAC fields (Ts/Nonce/Sig) are used only when the node is configured with an
+// hmac_secret (design §10). In that mode all three are REQUIRED on BOTH control-
+// and data-channel hellos: Sig = hex(HMAC-SHA256(secret, node+"|"+ts+"|"+nonce))
+// (see proto.SignHello), Nonce is 1..128 bytes and single-use, and Ts must be
+// within ±60s of the server clock. Nodes without hmac_secret keep the legacy
+// plaintext-key posture and ignore these fields.
 type Hello struct {
 	Role      string `json:"role"`
 	Node      string `json:"node"`

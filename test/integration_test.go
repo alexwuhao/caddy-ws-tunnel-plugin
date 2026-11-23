@@ -27,6 +27,7 @@ import (
 func TestMain(m *testing.M) {
 	goleak.VerifyTestMain(m,
 		goleak.IgnoreTopFunction("github.com/caddyserver/certmagic.(*Cache).maintainAssets"),
+		goleak.IgnoreTopFunction("github.com/caddyserver/certmagic.keepLockfileFresh"),
 		goleak.IgnoreTopFunction("internal/poll.runtime_pollWait"),
 		goleak.IgnoreAnyFunction("github.com/caddyserver/caddy/v2.(*UsagePool).LoadOrNew"),
 		goleak.IgnoreAnyFunction("net/http.(*persistConn).readLoop"),
@@ -65,14 +66,21 @@ func caddyJSON(wsPort, proxyPort, channels, maxStreams int, ports map[string]str
 		portLines = append(portLines, fmt.Sprintf("%q: %q", id, addr))
 	}
 	portsJSON := "{" + strings.Join(portLines, ",") + "}"
+	node := fmt.Sprintf(`{"key": "xx1", "channels": %d, "max_streams_per_conn": %d, "ports": %s}`,
+		channels, maxStreams, portsJSON)
+	return caddyJSONWithNode(wsPort, proxyPort, node, transportPort)
+}
 
+// caddyJSONWithNode is caddyJSON with the node1 object supplied verbatim, so
+// tests can add fields like hmac_secret.
+func caddyJSONWithNode(wsPort, proxyPort int, nodeJSON, transportPort string) string {
 	return fmt.Sprintf(`{
   "admin": {"disabled": false, "listen": "127.0.0.1:0"},
   "apps": {
     "tunnel": {
       "heartbeat": %d,
       "nodes": {
-        "node1": {"key": "xx1", "channels": %d, "max_streams_per_conn": %d, "ports": %s}
+        "node1": %s
       }
     },
     "http": {
@@ -95,17 +103,40 @@ func caddyJSON(wsPort, proxyPort, channels, maxStreams int, ports map[string]str
       }
     }
   }
-}`, int(15*time.Second), channels, maxStreams, portsJSON, wsPort, proxyPort, transportPort)
+}`, int(15*time.Second), nodeJSON, wsPort, proxyPort, transportPort)
 }
+
+// freePortsHandedOut tracks ports already returned by freePort so two servers in
+// one test never get the same listening address (the OS can hand the same
+// ephemeral port back after the probe listener closes, which makes Caddy reject
+// the config with "listener address repeated").
+var (
+	freePortsMu        sync.Mutex
+	freePortsHandedOut = map[int]struct{}{}
+)
 
 func freePort(t *testing.T) int {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	for i := 0; i < 200; i++ {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := ln.Addr().(*net.TCPAddr).Port
+		_ = ln.Close()
+
+		freePortsMu.Lock()
+		_, taken := freePortsHandedOut[p]
+		if !taken {
+			freePortsHandedOut[p] = struct{}{}
+		}
+		freePortsMu.Unlock()
+		if !taken {
+			return p
+		}
 	}
-	defer ln.Close()
-	return ln.Addr().(*net.TCPAddr).Port
+	t.Fatal("could not find an unused port")
+	return 0
 }
 
 // setup boots Caddy + stub client + echo, returns proxy base URL and cleanup.
@@ -312,6 +343,100 @@ func startEchoServerBlocking(t *testing.T) (addr string, stop func()) {
 	return ln.Addr().String(), func() { close(block); _ = srv.Close() }
 }
 
+// --- M3: peak_demand must not count the acquiring request twice ---
+
+func TestM3_PeakDemandNoDoubleCount(t *testing.T) {
+	// A slow echo keeps streams active long enough for concurrent acquisitions to
+	// overlap, which is when the queued+active double count would show up.
+	echoAddr, stopEcho := startSlowEchoServer(t, 150*time.Millisecond)
+	defer stopEcho()
+
+	wsPort := freePort(t)
+	proxyPort := freePort(t)
+	const conc = 10
+	cfg := caddyJSON(wsPort, proxyPort, 2, 256, map[string]string{"8080": echoAddr}, "8080")
+	var cc caddy.Config
+	if err := json.Unmarshal([]byte(cfg), &cc); err != nil {
+		t.Fatal(err)
+	}
+	if err := caddy.Run(&cc); err != nil {
+		t.Fatal(err)
+	}
+	defer caddy.Stop()
+
+	wsURL := fmt.Sprintf("ws://127.0.0.1:%d/ws", wsPort)
+	proxyURL := fmt.Sprintf("http://127.0.0.1:%d", proxyPort)
+	statusURL := fmt.Sprintf("http://127.0.0.1:%d/status", wsPort)
+	client := &stubclient.Client{URL: wsURL, Key: "xx1", LocalAddrOverride: echoAddr}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := client.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	waitFor(t, 3*time.Second, func() bool { return client.Channels() == 2 })
+
+	var wg sync.WaitGroup
+	for i := 0; i < conc; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, err := http.Post(proxyURL+"/", "text/plain", strings.NewReader("peak"))
+			if err == nil {
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+			}
+		}()
+	}
+	wg.Wait()
+
+	peak := statusPeakDemand(t, statusURL)
+	// Active-stream demand is at most conc. The old bug also counted each
+	// acquiring request as queued, pushing this to roughly 2×conc.
+	if peak < conc/2 {
+		t.Fatalf("peak_demand = %d, want ~%d (too low: requests did not overlap)", peak, conc)
+	}
+	if peak > conc+2 {
+		t.Fatalf("peak_demand = %d, want <= %d (double counting queued+active?)", peak, conc+2)
+	}
+}
+
+// startSlowEchoServer serves HTTP 200 after delay, keeping streams active.
+func startSlowEchoServer(t *testing.T, delay time.Duration) (addr string, stop func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		time.Sleep(delay)
+		_, _ = io.WriteString(w, "slow-ok")
+	})}
+	go srv.Serve(ln)
+	return ln.Addr().String(), func() { _ = srv.Close() }
+}
+
+func statusPeakDemand(t *testing.T, statusURL string) int64 {
+	t.Helper()
+	resp, err := http.Get(statusURL + "?node=node1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Nodes []struct {
+			Capacity struct {
+				PeakDemand int64 `json:"peak_demand"`
+			} `json:"capacity"`
+		} `json:"nodes"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil || len(out.Nodes) == 0 {
+		t.Fatalf("decode status: %v", err)
+	}
+	return out.Nodes[0].Capacity.PeakDemand
+}
+
 // --- M4: /status shape ---
 
 func TestM4_Status(t *testing.T) {
@@ -358,6 +483,160 @@ func TestM4_Status(t *testing.T) {
 		if len(n.Ports) != 2 {
 			t.Fatalf("%s: ports=%v, want 2", url, n.Ports)
 		}
+	}
+}
+
+// --- M4: traffic rate metrics come from the sliding window, not hard-coded 0 ---
+
+func TestM4_TrafficRateMetrics(t *testing.T) {
+	proxyURL, _, statusURL, _, cleanup := setup(t, 1, 256,
+		map[string]string{"8080": "127.0.0.1:8080"}, "8080")
+	defer cleanup()
+
+	// Keep traffic flowing across several 1s sampler ticks: a burst shorter than
+	// the first sample interval could land entirely inside one sample and then
+	// legitimately show a zero window delta.
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			resp, err := http.Post(proxyURL+"/", "text/plain", strings.NewReader("rate-probe-payload"))
+			if err == nil {
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}()
+
+	deadline := time.Now().Add(15 * time.Second)
+	var rateIn, rateOut int64
+	for time.Now().Before(deadline) {
+		rateIn, rateOut = statusRates(t, statusURL)
+		if rateIn > 0 && rateOut > 0 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	close(stop)
+	<-done
+	if rateIn <= 0 || rateOut <= 0 {
+		t.Fatalf("rate_in_bps=%d rate_out_bps=%d, want both > 0 (sliding window)", rateIn, rateOut)
+	}
+
+	// Cumulative byte counters must be non-zero and must not regress once the
+	// traffic stops (bytes from retired channels are folded into the node).
+	bytesIn1, bytesOut1 := statusBytes(t, statusURL)
+	if bytesIn1 <= 0 || bytesOut1 <= 0 {
+		t.Fatalf("bytes_in=%d bytes_out=%d, want both > 0", bytesIn1, bytesOut1)
+	}
+	time.Sleep(200 * time.Millisecond)
+	bytesIn2, bytesOut2 := statusBytes(t, statusURL)
+	if bytesIn2 < bytesIn1 || bytesOut2 < bytesOut1 {
+		t.Fatalf("cumulative bytes regressed: in %d->%d out %d->%d", bytesIn1, bytesIn2, bytesOut1, bytesOut2)
+	}
+}
+
+// statusTraffic is the subset of /status traffic fields the tests care about.
+type statusTraffic struct {
+	BytesIn    int64 `json:"bytes_in"`
+	BytesOut   int64 `json:"bytes_out"`
+	RateInBps  int64 `json:"rate_in_bps"`
+	RateOutBps int64 `json:"rate_out_bps"`
+}
+
+func getStatusTraffic(t *testing.T, statusURL string) (statusTraffic, bool) {
+	t.Helper()
+	resp, err := http.Get(statusURL + "?node=node1")
+	if err != nil {
+		return statusTraffic{}, false
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Nodes []struct {
+			Traffic statusTraffic `json:"traffic"`
+		} `json:"nodes"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&out) != nil || len(out.Nodes) == 0 {
+		return statusTraffic{}, false
+	}
+	return out.Nodes[0].Traffic, true
+}
+
+func statusRates(t *testing.T, statusURL string) (inBps, outBps int64) {
+	t.Helper()
+	tr, ok := getStatusTraffic(t, statusURL)
+	if !ok {
+		return 0, 0
+	}
+	return tr.RateInBps, tr.RateOutBps
+}
+
+func statusBytes(t *testing.T, statusURL string) (in, out int64) {
+	t.Helper()
+	tr, ok := getStatusTraffic(t, statusURL)
+	if !ok {
+		return 0, 0
+	}
+	return tr.BytesIn, tr.BytesOut
+}
+
+// --- M5: HMAC-signed hellos work end-to-end; plaintext clients are refused ---
+
+func TestM5_HMACHelloEndToEnd(t *testing.T) {
+	echoAddr, stopEcho := startEchoServer(t)
+	defer stopEcho()
+
+	wsPort := freePort(t)
+	proxyPort := freePort(t)
+	const secret = "test-hmac-secret-0123456789abcdef0123456789abcdef"
+	node := fmt.Sprintf(`{"key": "unused-in-hmac", "hmac_secret": %q, "channels": 1,
+		"max_streams_per_conn": 256, "ports": {"8080": %q}}`, secret, echoAddr)
+	cfg := caddyJSONWithNode(wsPort, proxyPort, node, "8080")
+	var cc caddy.Config
+	if err := json.Unmarshal([]byte(cfg), &cc); err != nil {
+		t.Fatal(err)
+	}
+	if err := caddy.Run(&cc); err != nil {
+		t.Fatal(err)
+	}
+	defer caddy.Stop()
+
+	wsURL := fmt.Sprintf("ws://127.0.0.1:%d/ws", wsPort)
+	proxyURL := fmt.Sprintf("http://127.0.0.1:%d", proxyPort)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// A properly signed client authenticates and routes traffic.
+	signed := &stubclient.Client{URL: wsURL, Key: "unused-in-hmac", HMACSecret: secret, LocalAddrOverride: echoAddr}
+	if err := signed.Start(ctx); err != nil {
+		t.Fatalf("signed client start: %v", err)
+	}
+	defer signed.Close()
+	waitFor(t, 3*time.Second, func() bool { return signed.Channels() == 1 })
+	if code := postCode(t, proxyURL, "hmac-ok"); code != 200 {
+		t.Fatalf("signed request status = %d, want 200", code)
+	}
+
+	// A plaintext client must be refused even though it sends the same key value
+	// the config carries: hmac_secret makes the node signature-only.
+	plain := &stubclient.Client{URL: wsURL, Key: "unused-in-hmac", LocalAddrOverride: echoAddr}
+	if err := plain.Start(ctx); err == nil {
+		plain.Close()
+		t.Fatal("plaintext client must be rejected by an HMAC node")
+	}
+
+	// A signed client using the wrong secret must be refused too.
+	wrong := &stubclient.Client{URL: wsURL, Key: "unused-in-hmac", HMACSecret: "wrong-secret", LocalAddrOverride: echoAddr}
+	if err := wrong.Start(ctx); err == nil {
+		wrong.Close()
+		t.Fatal("client with wrong hmac secret must be rejected")
 	}
 }
 
@@ -500,5 +779,3 @@ func TestM5_ReloadConfig(t *testing.T) {
 	waitFor(t, 3*time.Second, func() bool { return client.AllowlistSize() == 2 })
 	_ = statusURL
 }
-
-

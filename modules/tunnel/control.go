@@ -24,6 +24,9 @@ type controlChannel struct {
 	rttMs    int64 // atomic
 	closed   int32 // atomic
 
+	// onStats, when set, receives client telemetry frames (design §5 'stats').
+	onStats func(*proto.Stats)
+
 	done chan struct{}
 }
 
@@ -95,8 +98,13 @@ func (c *controlChannel) readLoop(ctx context.Context, onDrop func()) {
 				}
 			}
 		case proto.TypeStats:
-			// Telemetry from client; currently logged. /status primarily uses
-			// server-side counters. Stored for future use.
+			// Client telemetry (design §5): channel/stream counts, client-side
+			// byte totals and local dial errors. Server counters stay
+			// authoritative for traffic; dial errors only exist on the client.
+			var st proto.Stats
+			if json.Unmarshal(env.Payload, &st) == nil && c.onStats != nil {
+				c.onStats(&st)
+			}
 		case proto.TypeBye:
 			return
 		}

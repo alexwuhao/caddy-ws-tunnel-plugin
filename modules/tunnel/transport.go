@@ -97,16 +97,19 @@ func (t *TunnelTransport) Provision(ctx caddy.Context) error {
 	t.portID = pid
 
 	dialer := &NodeDialer{
-		app:          t.app,
-		nodeName:     t.Node,
-		portID:       pid,
-		queueTimeout: DefaultQueueTimeout,
-		dialTimeout:  DefaultDialTimeout,
+		app:      t.app,
+		nodeName: t.Node,
+		portID:   pid,
 	}
+	// Timeouts are read from the resident app at dial time (not snapshotted
+	// here): they can come from apps.tunnel JSON or from tunnel_server-level
+	// Caddyfile directives, and handler vs transport provision order is not
+	// guaranteed. ResponseHeaderTimeout is deliberately left at 0 so dial_timeout
+	// only bounds stream opening (design §3.4) and a slow backend is not turned
+	// into a spurious 502.
 	t.rt = &http.Transport{
 		DialContext:           dialer.DialContext,
 		DisableKeepAlives:     true, // one request = one stream (design §0 #9)
-		ResponseHeaderTimeout: DefaultDialTimeout,
 		ExpectContinueTimeout: time.Second,
 	}
 	return nil

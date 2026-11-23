@@ -26,6 +26,13 @@ type TunnelServer struct {
 	// merged into the app on Provision.
 	Nodes map[string]*NodeConfig `json:"nodes,omitempty"`
 
+	// Optional global tunables set as tunnel_server Caddyfile directives. They
+	// override the resident app's defaults at Provision time (JSON users set the
+	// same knobs in apps.tunnel instead). Zero means "keep app/default value".
+	Heartbeat    caddy.Duration `json:"heartbeat,omitempty"`
+	DialTimeout  caddy.Duration `json:"dial_timeout,omitempty"`
+	QueueTimeout caddy.Duration `json:"queue_timeout,omitempty"`
+
 	app *TunnelApp
 	log *zap.Logger
 }
@@ -48,6 +55,18 @@ func (h *TunnelServer) Provision(ctx caddy.Context) error {
 	}
 	h.app = appIface.(*TunnelApp)
 
+	// Apply tunnel_server-level tunables before nodes are created below, so the
+	// per-node grace window and dial/queue timeouts see them.
+	if h.Heartbeat > 0 {
+		h.app.Heartbeat = h.Heartbeat
+	}
+	if h.DialTimeout > 0 {
+		h.app.DialTimeout = h.DialTimeout
+	}
+	if h.QueueTimeout > 0 {
+		h.app.QueueTimeout = h.QueueTimeout
+	}
+
 	// Merge handler-declared nodes into the app registry so a standalone
 	// tunnel_server block works without a separate global app config.
 	hb := h.app.heartbeat()
@@ -56,7 +75,7 @@ func (h *TunnelServer) Provision(ctx caddy.Context) error {
 			cfg = &NodeConfig{}
 		}
 		cfg.fill()
-		if err := validatePorts(name, cfg.Ports); err != nil {
+		if err := validateNodeConfig(name, cfg); err != nil {
 			return err
 		}
 		if h.app.Nodes == nil {
@@ -64,7 +83,10 @@ func (h *TunnelServer) Provision(ctx caddy.Context) error {
 		}
 		h.app.Nodes[name] = cfg
 		if _, ok := h.app.registry.Get(name); !ok {
-			h.app.registry.put(newNode(name, cfg, hb, h.log))
+			nd := newNode(name, cfg, hb, h.log)
+			nd.dialTimeout = h.app.dialTimeout()
+			nd.queueTimeout = h.app.queueTimeout()
+			h.app.registry.put(nd)
 		}
 	}
 	return nil
@@ -91,7 +113,17 @@ func (h *TunnelServer) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddy
 		return nil
 	}
 
-	if !h.app.Authenticate(hello.Node, hello.Key) {
+	// AuthenticateHello enforces the node's configured posture: HMAC signature
+	// on both control- and data-channel hellos when hmac_secret is set,
+	// otherwise the legacy plaintext key (constant-time compare).
+	if err := h.app.AuthenticateHello(hello); err != nil {
+		h.log.Warn("tunnel auth failed",
+			zap.String("node", hello.Node),
+			zap.String("role", hello.Role),
+			zap.String("remote", r.RemoteAddr),
+			zap.Error(err))
+		// The close reason is deliberately generic: diagnostics go to the log,
+		// never to an unauthenticated peer (no secret or replay hints leak).
 		_ = c.Close(websocket.StatusPolicyViolation, "auth failed")
 		return nil
 	}

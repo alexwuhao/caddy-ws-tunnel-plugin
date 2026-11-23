@@ -17,6 +17,7 @@ type metrics struct {
 	channelsNeededPeak *prometheus.GaugeVec
 	streamOpenTotal    *prometheus.CounterVec // labels: node, result
 	bytesTotal         *prometheus.GaugeVec   // labels: node, dir(in|out)
+	bytesRate          *prometheus.GaugeVec   // labels: node, dir(in|out); bytes/second
 	saturatedTotal     *prometheus.GaugeVec
 	localDialErrors    *prometheus.GaugeVec
 }
@@ -34,6 +35,7 @@ func newMetrics() *metrics {
 		streamsPeak:        factory("tunnel_streams_peak", "peak concurrent demand (incl queued)", []string{"node"}),
 		channelsNeededPeak: factory("tunnel_channels_needed_peak", "channels needed at peak demand", []string{"node"}),
 		bytesTotal:         factory("tunnel_bytes_total", "bytes transferred by direction", []string{"node", "dir"}),
+		bytesRate:          factory("tunnel_bytes_rate_bps", "sliding-window byte rate by direction (bytes/second, NOT bits/second)", []string{"node", "dir"}),
 		saturatedTotal:     factory("tunnel_node_saturated_total", "times all channels were saturated", []string{"node"}),
 		localDialErrors:    factory("tunnel_local_dial_errors_total", "client-reported local dial errors", []string{"node"}),
 	}
@@ -66,25 +68,27 @@ func (m *metrics) update(n *Node) {
 	n.mu.RLock()
 	up := n.control != nil && n.controlDown.IsZero()
 	online := 0
-	var in, out int64
+	var active int64
 	for _, ch := range n.channels {
 		if ch.online() {
 			online++
 		}
-		bi, bo := ch.trafficBytes()
-		in += bi
-		out += bo
-	}
-	configured := n.cfg.Channels
-	peak := n.peakDemand
-	needed := n.channelsNeededAtPeak
-	sat := n.saturatedTotal
-	var active int64
-	for _, ch := range n.channels {
 		active += atomic.LoadInt64(&ch.active)
 	}
+	configured := n.cfg.Channels
+	// peakDemand/saturatedTotal are written with atomic ops on the hot path, so
+	// they must be read atomically here too (mixing atomic and plain access to
+	// the same word is a data race).
+	peak := atomic.LoadInt64(&n.peakDemand)
+	needed := n.channelsNeededAtPeak
+	sat := atomic.LoadInt64(&n.saturatedTotal)
+	dialErrors := atomic.LoadInt64(&n.clientDialErrors)
 	name := n.Name
 	n.mu.RUnlock()
+
+	// Traffic totals/rates take their own locks, so read them outside the RLock.
+	in, out := n.TrafficTotals()
+	rateIn, rateOut := n.Rates()
 
 	upv := 0.0
 	if up {
@@ -98,5 +102,8 @@ func (m *metrics) update(n *Node) {
 	m.channelsNeededPeak.WithLabelValues(name).Set(float64(needed))
 	m.bytesTotal.WithLabelValues(name, "in").Set(float64(in))
 	m.bytesTotal.WithLabelValues(name, "out").Set(float64(out))
+	m.bytesRate.WithLabelValues(name, "in").Set(float64(rateIn))
+	m.bytesRate.WithLabelValues(name, "out").Set(float64(rateOut))
 	m.saturatedTotal.WithLabelValues(name).Set(float64(sat))
+	m.localDialErrors.WithLabelValues(name).Set(float64(dialErrors))
 }

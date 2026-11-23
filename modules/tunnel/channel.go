@@ -102,8 +102,8 @@ func (c *dataChannel) trafficBytes() (in, out int64) {
 // slot exactly once. This is the net.Conn handed to http.Transport.
 type streamConn struct {
 	net.Conn
-	ch       *dataChannel
-	once     sync.Once
+	ch   *dataChannel
+	once sync.Once
 }
 
 func (s *streamConn) Close() error {

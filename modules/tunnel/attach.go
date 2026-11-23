@@ -27,6 +27,8 @@ func smuxConfig() *smux.Config {
 // starts the read/ping loops. Blocks until the control channel drops.
 func (n *Node) attachControl(ctx context.Context, conn *websocket.Conn, heartbeat time.Duration, log *zap.Logger) error {
 	cc := newControlChannel(conn, log)
+	// Client telemetry frames are applied to this node (design §5 'stats').
+	cc.onStats = n.applyStats
 
 	n.mu.Lock()
 	// Preserve session across in-grace reconnect so existing data channels
@@ -41,6 +43,10 @@ func (n *Node) attachControl(ctx context.Context, conn *websocket.Conn, heartbea
 	n.control = cc
 	n.controlDown = time.Time{} // mark up
 	session := n.session
+	channels := n.cfg.Channels
+	// Build the wire config under the read lock: toProtoConfig copies the ports
+	// map, which Reconfigure can swap concurrently.
+	wireCfg := n.cfg.toProtoConfig(n.dialTimeout, n.queueTimeout)
 	n.mu.Unlock()
 
 	if inGraceReconnect {
@@ -50,8 +56,8 @@ func (n *Node) attachControl(ctx context.Context, conn *websocket.Conn, heartbea
 	welcome := proto.Welcome{
 		Session:   session,
 		Heartbeat: heartbeat.String(),
-		Channels:  n.cfg.Channels,
-		Config:    n.cfg.toProtoConfig(),
+		Channels:  channels,
+		Config:    wireCfg,
 		Mux: &proto.Mux{
 			KeepAliveItvl:    (10 * time.Second).String(),
 			KeepAliveTimeout: (30 * time.Second).String(),
@@ -103,6 +109,9 @@ func (n *Node) attachData(ctx context.Context, conn *websocket.Conn, hello *prot
 	n.mu.Lock()
 	if old, ok := n.channels[hello.ChannelID]; ok {
 		old.close()
+		// Fold the replaced channel's byte counters into the node totals before
+		// overwriting the map entry, so traffic/rate stats survive reconnects.
+		n.retireChannelLocked(old)
 		n.dataReconnectTotal++ // Track reconnect events
 	}
 	n.channels[hello.ChannelID] = ch
@@ -131,6 +140,7 @@ func (n *Node) attachData(ctx context.Context, conn *websocket.Conn, hello *prot
 	n.mu.Lock()
 	if n.channels[hello.ChannelID] == ch {
 		delete(n.channels, hello.ChannelID)
+		n.retireChannelLocked(ch)
 	}
 	n.mu.Unlock()
 	ch.close()
@@ -158,6 +168,7 @@ func (n *Node) checkGrace() {
 
 	for id, ch := range n.channels {
 		ch.close()
+		n.retireChannelLocked(ch)
 		delete(n.channels, id)
 	}
 	n.session = ""
@@ -178,7 +189,7 @@ func (n *Node) checkGrace() {
 func (n *Node) pushReloadConfig(ctx context.Context) error {
 	n.mu.RLock()
 	cc := n.control
-	cfg := n.cfg.toProtoConfig()
+	cfg := n.cfg.toProtoConfig(n.dialTimeout, n.queueTimeout)
 	n.mu.RUnlock()
 	if cc == nil || cc.isClosed() {
 		return ErrNodeDownNewStream
@@ -223,6 +234,7 @@ func (n *Node) shutdown() {
 	}
 	for id, ch := range n.channels {
 		ch.close()
+		n.retireChannelLocked(ch)
 		delete(n.channels, id)
 	}
 	n.session = ""
