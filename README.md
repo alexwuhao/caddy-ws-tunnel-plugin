@@ -105,6 +105,22 @@ db.internal.example.com {
 }
 ```
 
+## 客户端（tunnel-agent）
+
+服务端需要一个主动外连的 agent 运行在 NAT/内网侧。Windows / Linux / macOS 二进制见
+[**caddy-ws-tunnel-client releases**](https://github.com/alexwuhao/caddy-ws-tunnel-client/releases)
+（`tunnel-agent ≥ v1.1.0` 才支持本仓库的 HMAC 模式；旧版本只能走明文 key）。
+
+```powershell
+# 明文 key 模式（兼容所有版本）
+tunnel-agent-windows-amd64.exe --url wss://caddy.example.com:8443/ws --key xx1
+
+# HMAC 模式（服务端节点配置 hmac_secret 后必须升到 v1.1.0+）
+tunnel-agent-windows-amd64.exe --url wss://caddy.example.com:8443/ws --node node1 --secret "<hmac_secret>"
+```
+
+Windows 后台常驻建议用 NSSM 或任务计划程序（客户端仓库 README 有命令示例）。
+
 ## 配置参数详解
 
 ### 节点配置（`tunnel_server` 块内）
@@ -225,7 +241,7 @@ hello := proto.Hello{
 
 ### 兼容性与注意
 
-- 这是**协议级可选扩展**：现有明文 client 无需改动即可继续用；要启用 HMAC 需要 client 侧升级（`caddy-ws-tunnel-client` 需按上面的签名步骤实现）。
+- 这是**协议级可选扩展**：现有明文 client 无需改动即可继续用；要启用 HMAC 需要 `tunnel-agent` **≥ v1.1.0**（该版本起控制/数据通道 hello 均签名，且 secret 不再作为明文 key 发送）。配套客户端构建见 [caddy-ws-tunnel-client v1.1.0](https://github.com/alexwuhao/caddy-ws-tunnel-client/releases/tag/v1.1.0)（上游 `wjzhangq/caddy-ws-tunnel-client` 待同步该修复）。
 - `hmac_secret` 就是共享密钥，等同于密码：请用 `openssl rand -hex 32` 之类生成，不要提交进仓库；轮换时更新 Caddy 配置与 client 侧即可（旧 secret 立即失效）。
 - 建议始终配合 `wss://`（TLS），HMAC 解决的是"密码不上线 + 防重放"，不替代传输加密。
 
