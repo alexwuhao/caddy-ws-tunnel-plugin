@@ -105,14 +105,14 @@ Caddy 侧不需要真实可达的 upstream 地址,而是暴露一个内部 Diale
 
 ```caddyfile
 node1.example.com {
-    reverse_proxy {
+    reverse_proxy tunnel {          # 占位 upstream(必须非空,Caddy 才会调用自定义 transport)
         transport tunnel node1:8080   # 直达 node1 的 8080 端口
     }
 }
 
 # 等价的展开写法
 db.internal.example.com {
-    reverse_proxy {
+    reverse_proxy tunnel {
         transport tunnel {
             node node1
             port 5432
@@ -121,7 +121,7 @@ db.internal.example.com {
 }
 ```
 
-`transport tunnel node1:port` = 不走 TCP,而是经隧道数据通道把请求送达 `node1` 的指定端口。`node1:8080` 中 `8080` 是端口 id,服务端解析为 client 本地地址。
+`transport tunnel node1:port` = 不走 TCP,而是经隧道数据通道把请求送达 `node1` 的指定端口。`node1:8080` 中 `8080` 是端口 id,服务端解析为 client 本地地址。`reverse_proxy` 的 upstream 参数只是占位(地址不会被拨号),但**必须非空**,否则 Caddy 直接 503。
 
 ### 3.3 Client(只需 url + key)
 

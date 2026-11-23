@@ -33,7 +33,9 @@
 # Business ingress: external request -> tunnel.
 node1.localhost {
 	tls internal
-	reverse_proxy {
+	# The "tunnel" argument is a non-empty placeholder upstream: Caddy only calls
+	# the custom transport when an upstream exists (an empty upstream list → 503).
+	reverse_proxy tunnel {
 		transport tunnel node1:8080
 	}
 }

@@ -69,14 +69,16 @@ xcaddy build v2.11.4 --with github.com/wjzhangq/caddy-ws-tunnel-plugin=.
 
 # 业务入口：外部请求经隧道到达 client 本地
 node1.example.com {
-    reverse_proxy {
-        transport tunnel node1:8080   # 内联写法
+    # 注意：reverse_proxy 后面必须跟一个非空 upstream（这里用占位名 tunnel）。
+    # Caddy 只有在存在 upstream 时才会调用自定义 transport；留空会直接 503。
+    reverse_proxy tunnel {
+        transport tunnel node1:8080   # 内联写法：真正的寻址由 transport 决定
     }
 }
 
 # 等价展开写法
 db.internal.example.com {
-    reverse_proxy {
+    reverse_proxy tunnel {
         transport tunnel {
             node node1
             port 5432
@@ -84,6 +86,8 @@ db.internal.example.com {
     }
 }
 ```
+
+> **易错点**：`reverse_proxy` 的第一个参数是**占位 upstream**（名字随意，如 `tunnel`），它的地址不会被真正拨号；寻址由 `transport tunnel node:port` 决定。写成 `reverse_proxy { transport tunnel ... }`（不给 upstream）会被 Caddy 判定为没有上游，直接返回 **503**，transport 根本不会被调用。
 
 ### JSON 配置
 

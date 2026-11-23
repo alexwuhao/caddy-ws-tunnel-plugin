@@ -722,6 +722,9 @@ if n.session == "" { n.session = generateSession() }  // 仅首次或宽限期�
 20. **`opened_total` 不是请求数。**
     它只在 `DialContext` 成功写完流头后 `incOpened()`，因此"失败于写头/开流"的请求不计入开流总数，但会计入 `tunnel_stream_open_total` 的失败 result。
 
+21. **Caddyfile 的 `reverse_proxy` 必须给占位 upstream。**
+    正确写法：`reverse_proxy tunnel { transport tunnel node1:8080 }`。`tunnel` 只是占位，地址不会被拨号（真实寻址由 transport 的 `node`/`port` 决定），但 Caddy 只有在 upstream 列表非空时才会调用自定义 transport；写成 `reverse_proxy { transport tunnel ... }` 会被判定"没有上游"并**直接 503**（适配出的 JSON 里 `upstreams` 为空），transport 根本不会执行。`test/Caddyfile.test` 与 README 示例已按此修正。
+
 ---
 
 ## 9. 配置参数与默认值
