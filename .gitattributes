@@ -1,0 +1,3 @@
+# Normalize line endings: LF in the repository and in the working tree.
+# This keeps `gofmt -l .` stable across Windows/Linux/macOS contributors and CI.
+* text=auto eol=lf

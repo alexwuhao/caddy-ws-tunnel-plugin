@@ -3,6 +3,8 @@
 > 目标 Caddy:v2.11.x · 语言:Go 1.25+ · 形态:Caddy 插件(`xcaddy build` 编译,不 fork)
 >
 > 多路复用:WS 上跑 **smux** · 数据通道 **固定 `channels` 条**(无动态扩缩容) · client 仅需 `url + key`
+>
+> **实现状态(2026-11-23)**:M1–M6 已全部落地。§10 的 HMAC 挑战应答已实现为**按节点的可选模式**(Caddyfile/JSON `hmac_secret`),未配置时保持明文 key;§12 的速率估算已实现(1s 采样 × 10s 滑动窗口,单位 **B/s**);M6 压测结果见 [`docs/M6-benchmark-report.md`](docs/M6-benchmark-report.md)。
 
 ---
 
@@ -270,7 +272,7 @@ Caddy 侧                                  Client 侧
 
 去掉了自动扩容,改用离线判断信号:
 
-- **`peak_demand`**:并发需求高水位 = `max(active_streams + queued_requests)`(滑动窗口),**含被排队/拒绝的部分**,反映真实想要的并发,不被容量上限截断。
+- **`peak_demand`**:并发需求高水位 = `max(active_streams + queued_requests)`(进程内单调高水位,不随时间衰减,重载/重启清零),**含被排队/拒绝的部分**,反映真实想要的并发,不被容量上限截断。
 - **`channels_needed_at_peak`** = `ceil(peak_demand / max_streams_per_conn)` —— 高峰时理论上需要几条通道。
   - `> channels` ⇒ 高峰打满过,建议调大 `channels`。
   - 长期 `≤ channels` ⇒ 容量充裕,可下调省连接。
@@ -427,7 +429,7 @@ func (t *TunnelTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 ## 10. 鉴权与安全
 
 - **最低**:`key` 明文握手 + `wss`(TLS)。
-- **建议(HMAC 挑战,防重放)**:client 发 `hello{node, key_id, ts, nonce, sig}`,`sig = HMAC-SHA256(secret, node|ts|nonce)`;Caddy 校验 sig、`ts` 在窗口内、`nonce` 近期未用(LRU 防重放)。
+- **建议(HMAC 挑战,防重放,已实现为可选模式)**:client 发 `hello{node, key_id, ts, nonce, sig}`,`sig = HMAC-SHA256(secret, node|ts|nonce)`;Caddy 校验 sig、`ts` 在窗口内(±60s)、`nonce` 近期未用(有界 LRU 防重放)。节点配置 `hmac_secret` 即启用;未配置的节点保持上面的明文姿势(兼容旧 client)。实现与客户端签名契约见 `modules/tunnel/proto/auth.go`。
 - **数据通道绑定**:数据通道握手须带 control 阶段的 `session`,防孤立数据连接注入。
 - **端口白名单**:client 只 dial 服务端下发清单内的端口 id,清单外拒绝(防任意 dial)。
 - **隔离**:不同 node 的流按命名空间严格隔离,杜绝跨 node 串流。
@@ -523,4 +525,4 @@ func (t *TunnelTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 3. **M3 固定连接池**:固定 `channels`、PickChannel(least-loaded)、背压排队、峰值统计。
 4. **M4 transport + 状态接口**:`transport tunnel node:port`(内联+块)接入 `reverse_proxy`;`/status`。
 5. **M5 健壮性**:心跳/重连/故障矩阵、HMAC 鉴权、Prometheus 指标。
-6. **M6 压测调参**:HOL 实测、`max_streams_per_conn × channels` 配比、smux 窗口;按峰值统计定容量。
+6. **M6 压测调参**:HOL 实测、`max_streams_per_conn × channels` 配比、smux 窗口;按峰值统计定容量。**已交付**:可复现基准 `test/bench_test.go` + 实测报告 [`docs/M6-benchmark-report.md`](docs/M6-benchmark-report.md)。
